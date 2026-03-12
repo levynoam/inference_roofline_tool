@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Inference Performance Analyzer</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LLM Inference Architectural Analyzer</h1>            
+        </header>
+
+        <div class="main-content">
+            <!-- Top Row: Configuration and Results -->
+            <div class="top-row">
+                <!-- Left: Input Controls (2 columns) -->
+                <div class="input-panel">
+                    <h2>Configuration</h2>
+                    
+                    <div class="input-columns">
+                        <!-- Left Column -->
+                        <div class="input-column">
+                            <!-- Model Selection -->
+                            <div class="section">
+                                <h3>Model</h3>
+                                <select id="model" class="input-field">
+                                    {% for model in models %}
+                                    <option value="{{ model }}">{{ model }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+
+                            <!-- System Configuration -->
+                            <div class="section">
+                                <h3>System Hardware</h3>
+                                <div class="input-group">
+                                    <label>Memory (GB)</label>
+                                    <input type="number" id="memory" class="input-field" value="256" step="16">
+                                </div>
+                                <div class="input-group">
+                                    <label>Compute (TFLOPS)</label>
+                                    <input type="number" id="compute" class="input-field" value="4500" step="100">
+                                </div>
+                                <div class="input-group">
+                                    <label>Memory BW (GB/s)</label>
+                                    <input type="number" id="memory_bw" class="input-field" value="8000" step="500">
+                                </div>
+                                <div class="input-group">
+                                    <label>Network BW (GB/s)</label>
+                                    <input type="number" id="network_bw" class="input-field" value="600" step="50">
+                                </div>
+                                <div class="input-group">
+                                    <label>Storage BW (GB/s)</label>
+                                    <input type="number" id="storage_bw" class="input-field" value="20" step="5">
+                                </div>
+                                <div class="input-group">
+                                    <label>Kernel Latency (µs)</label>
+                                    <input type="number" id="kernel_latency" class="input-field" value="5" step="0.1">
+                                </div>
+                                <div class="input-group">
+                                    <label>Data Type</label>
+                                    <select id="dtype" class="input-field">
+                                        <option value="">Model Default</option>
+                                        <option value="int4">4-bit (INT4)</option>
+                                        <option value="int8">8-bit (INT8)</option>
+                                        <option value="float16">16-bit (FP16)</option>
+                                        <option value="bfloat16">16-bit (BF16)</option>
+                                        <option value="float32">32-bit (FP32)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Workload Parameters -->
+                            <div class="section">
+                                <h3>Workload</h3>
+                                <div class="input-group">
+                                    <label>Batch Size</label>
+                                    <input type="number" id="batch_size" class="input-field" value="8" step="1">
+                                </div>
+                                
+                                <!-- Calculation Type -->
+                                <div class="input-group">
+                                    <label>Calculation Type</label>
+                                    <div class="radio-group">
+                                        <label><input type="radio" name="calc_type" value="TTFT"> TTFT</label>                                        
+                                        <label><input type="radio" name="calc_type" value="DECODE" checked> Decode</label>                                        
+                                    </div>
+                                </div>
+
+                                <!-- TTFT Parameters -->
+                                <div id="ttft-params">
+                                    <div class="input-group">
+                                        <label>Sequence Length</label>
+                                        <input type="number" id="sequence_length" class="input-field" value="2048" step="128">
+                                    </div>
+                                </div>
+
+                                <!-- Decode Parameters -->
+                                <div id="decode-params" style="display: none;">
+                                    <div class="input-group">
+                                        <label>Prefill Length</label>
+                                        <input type="number" id="prefill_length" class="input-field" value="2048" step="128">
+                                    </div>
+                                    <div class="input-group">
+                                        <label>Output Length</label>
+                                        <input type="number" id="output_length" class="input-field" value="8192" step="1024">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Right Column -->
+                        <div class="input-column">
+                            <!-- Parallelism -->
+                            <div class="section">
+                                <h3>Parallelism</h3>
+                                <div class="input-group">
+                                    <label>Type</label>
+                                    <select id="parallelism" class="input-field">
+                                        <option value="None">None</option>
+                                        <option value="TENSOR_PARALLEL">Tensor Parallel</option>
+                                        <option value="PIPELINE_PARALLEL">Pipeline Parallel</option>
+                                    </select>
+                                </div>
+                                <div id="parallel-params" style="display: none;">
+                                    <div class="input-group">
+                                        <label># of GPUs</label>
+                                        <input type="number" id="num_gpus" class="input-field" value="2" step="1" min="1">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <button id="export-btn" class="btn" style="position: absolute; right: 10px; bottom: 10px; width: 20%; padding: 4px 8px; font-size: 0.75em; opacity: 0.6; background: #ddd; color: #666; z-index: 10;">Export Config</button>
+
+                            <!-- Actions -->
+                            <div class="section">
+                                <button id="calculate-btn" class="btn btn-primary">Calculate Performance</button>
+                            </div>
+
+                            <!-- Batch Analysis -->
+                            <div class="section">
+                                <h3>Batch Analysis</h3>
+                                <div class="input-group">
+                                    <label>Parameter to Sweep</label>
+                                    <select id="batch_param" class="input-field">                                        
+                                        <option value="memory_bw">Memory BW (GB/s)</option>
+                                        <option value="batch_size">Batch Size</option>
+                                        <option value="compute">Compute (TFLOPS)</option>                              
+                                        <option value="kernel_latency">Kernel Latency (µs)</option>                                                                                                                        
+                                        <option value="sequence_length">Sequence Length (Prefill)</option>
+                                        <option value="prefill_length">Prefill Length (Decode)</option>
+                                        <option value="output_length">Output Length (Decode)</option>
+                                        <option value="network_bw">Network BW (GB/s)</option>
+                                        <option value="storage_bw">Storage BW (GB/s)</option>
+                                        <option value="memory">Memory (GB)</option>
+                                    </select>
+                                </div>
+                                <div class="input-row">
+                                    <div class="input-group">
+                                        <label>Min</label>
+                                        <input type="number" id="batch_min" class="input-field" value="96" step="0.1">
+                                    </div>
+                                    <div class="input-group">
+                                        <label>Max</label>
+                                        <input type="number" id="batch_max" class="input-field" value="768" step="0.1">
+                                    </div>
+                                </div>
+                                <div class="input-group">
+                                    <label>Number of Points</label>
+                                    <input type="number" id="batch_points" class="input-field" value="20" step="1">
+                                </div>
+                                <button id="batch-btn" class="btn btn-secondary">Run Batch Analysis</button>
+                                <button id="export-results-btn" class="btn btn-secondary" style="margin-top: 10px; display: none;">Export Results</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Right: Results Panel -->
+                <div class="results-panel-compact">
+                    <div class="results-text" id="results-text">
+                        <h2>Results</h2>
+                        <p class="placeholder">Run a calculation to see results here...</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bottom Row: Charts (4 across) -->
+            <div class="charts-row">
+                <!-- Resource Utilization Chart -->
+                <div class="chart-container">
+                    <h3>Resource Utilization</h3>
+                    <div id="resource-chart"></div>
+                </div>
+
+                <!-- Memory Breakdown Chart -->
+                <div class="chart-container">
+                    <h3>Memory Breakdown</h3>
+                    <div id="memory-chart"></div>
+                </div>
+
+                <!-- Compute Breakdown Chart -->
+                <div class="chart-container">
+                    <h3>Compute Breakdown</h3>
+                    <div id="compute-chart"></div>
+                </div>
+
+                <!-- Time Breakdown Chart -->
+                <div class="chart-container">
+                    <h3>Time Breakdown</h3>
+                    <div id="time-chart"></div>
+                </div>
+            </div>
+
+            <!-- Model Architecture Section -->
+            <div class="model-architecture-section" id="model-architecture" style="display: none;">
+                <h2>Model Architecture</h2>
+                <div class="architecture-details" id="architecture-details"></div>
+            </div>
+
+            <!-- Per-Layer Breakdown Graphs -->
+            <div class="per-layer-graphs" id="per-layer-graphs" style="display: none;">
+                <div class="per-layer-chart-container">
+                    <div id="per-layer-compute-chart"></div>
+                </div>
+                <div class="per-layer-chart-container">
+                    <div id="per-layer-bandwidth-chart"></div>
+                </div>
+                <div class="per-layer-chart-container">
+                    <div id="per-layer-kernels-chart"></div>
+                </div>
+            </div>
+
+            <!-- Batch Analysis Graphs (asymmetric grid) -->
+            <div class="batch-graphs-row">
+                <div class="chart-container">
+                    <h3>Performance</h3>
+                    <div id="batch-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Compute (PF/sec)</h3>
+                    <div id="batch-compute-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Kernel Launch Overhead (%)</h3>
+                    <div id="batch-kernel-overhead-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Network Bandwidth (GB/sec)</h3>
+                    <div id="batch-network-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Memory Bandwidth (TB/sec)</h3>
+                    <div id="batch-bandwidth-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Throughput vs TPS</h3>
+                    <div id="batch-throughput-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3 id="batch-compute-performance-title">Compute vs Performance</h3>
+                    <div id="batch-compute-performance-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>KV Cache Bandwidth (TB/sec)</h3>
+                    <div id="batch-kv-bandwidth-chart"></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Weights Bandwidth (TB/sec)</h3>
+                    <div id="batch-weights-bandwidth-chart"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

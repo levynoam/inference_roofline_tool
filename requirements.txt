@@ -1,0 +1,15 @@
+# Core dependencies
+numpy>=2.0.0
+pandas>=2.0.0
+
+# Web application
+Flask>=3.0.0
+
+# Excel export
+openpyxl>=3.0.0
+
+# Testing
+pytest>=8.0.0
+
+# Optional: Data visualization (if needed for future features)
+matplotlib>=3.8.0

@@ -309,6 +309,4 @@ For questions or issues:
 3. Enable DEBUG_VERBOSE for detailed logging
 4. Examine web app implementation for integration patterns
 
-## Questions
-levynoam@gmail.com
 

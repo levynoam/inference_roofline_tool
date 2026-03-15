@@ -358,62 +358,59 @@ result = perf.calculate_decode_performance(
 # KV cache size is automatically reduced based on mla_kv_lora_rank
 ```
 
-### Hybrid Architectures (Conv + Attention Layers)
+### Hybrid Architectures
 
-Some modern models like **LFM2** (Liquid Foundation Model 2) use hybrid architectures that combine convolution layers with traditional attention layers. For example, LFM2-3B has 10 convolution layers and 6 attention layers (16 total).
+The framework supports three levels of hybrid architecture modeling:
 
-**How Hybrid Layers Are Modeled:**
+**1. Approximate hybrid (conv + attention, e.g., LFM2)**
 
-The performance calculator currently models all layers uniformly as full transformer layers (attention + FFN). This is a conservative approximation:
+Some models like **LFM2** combine convolution layers with attention layers. The calculator treats all layers uniformly as full transformer layers (conservative upper-bound estimate). KV cache is overestimated; compute is slightly overestimated for conv layers.
 
-1. **Compute (FLOPs)**: Each layer is computed as having both attention AND FFN operations. For hybrid models:
-   - The attention FLOPs are overestimated (conv layers don't have Q/K/V projections or attention scores)
-   - The FFN FLOPs are reasonable (conv layers have similar compute to FFN - both are O(seq_len) rather than O(seq_len²))
-   - Overall, this provides a conservative upper bound on compute requirements
+**2. Exact Mamba-2 / Attention hybrid (e.g., Nemotron-3-30B)**
 
-2. **KV Cache**: The KV cache is calculated using `num_layers` (total layers), meaning all layers are assumed to store key-value pairs:
-   - For LFM2 with 6 attention layers out of 16, the actual KV cache would be ~37.5% of the calculated value
-   - This conservative estimate ensures sufficient memory is allocated
+Models that designate each layer as `MAMBA`, `ATTENTION`, or `MLP` via `hybrid_layer_types` are handled exactly:
+- KV cache only from attention layers
+- Mamba state (constant size) only from Mamba layers
+- Attention FLOPs only from attention-type layers
+- Mamba SSM FLOPs only from Mamba-type layers
 
-3. **Memory Bandwidth**: Model weights are streamed based on total parameters. Convolution weights are similar in size to FFN weights, so bandwidth estimates are accurate.
+**3. Sublayer-style hybrid (e.g., Nemotron-3-Super-120B)**
 
-4. **Network Traffic**: Communication overhead uses `num_layers` for all-reduce operations, which may slightly overestimate for layers without attention.
+In these models, each entry in `hybrid_layer_types` is a _single standalone operation_ (`MAMBA_ONLY`, `LATENT_MOE`, or `ATTENTION_ONLY`). Each sublayer does exactly one thing — no combined blocks:
+- `MAMBA_ONLY`: Mamba-2 SSM, no FFN
+- `LATENT_MOE`: Latent-space MoE FFN, no attention or Mamba
+- `ATTENTION_ONLY`: Standard GQA attention, no FFN
 
-**Example with LFM2:**
+Memory effects:
+- KV cache only from `ATTENTION` / `ATTENTION_ONLY` sublayers
+- Mamba state only from `MAMBA` / `MAMBA_ONLY` sublayers
+- `LATENT_MOE` sublayers contribute only weight traffic (no stateful memory)
+
 ```python
-from llm_configs import LFM2_3B
+from llm_configs import NEMOTRON_3_SUPER_120B
 from inference_performance import InferencePerformance, SystemConstraints
 
-perf = InferencePerformance(LFM2_3B)
+perf = InferencePerformance(NEMOTRON_3_SUPER_120B)
 gpu = SystemConstraints.from_gpu_spec("H100")
 
-# LFM2-3B: 16 layers (10 conv + 6 attention)
-# Calculator treats this as 16 full transformer layers
-# Compute estimate: Conservative (attention FLOPs overestimated for conv layers)
-# KV cache estimate: Conservative (only 6 layers actually need KV cache)
+# 88 sublayers: 40 Mamba, 40 LatentMoE, 8 Attention
+# KV cache: from 8 attention sublayers only
+# Mamba state: from 40 Mamba sublayers only
+# Compute: 3 separate components
 
 result = perf.calculate_achievable_ttft(
     system_constraints=gpu,
-    batch_size=16,
+    batch_size=1,
     sequence_length=4096
 )
 
 print(f"TTFT: {result.achievable_ttft * 1000:.2f} ms")
-print(f"Memory: {result.memory_utilization * 100:.1f}%")
+print(f"Bottleneck: {result.bottleneck_resource}")
 ```
 
-**Practical Implications:**
-- **Memory estimates** will be higher than actual (safe for capacity planning)
-- **Compute time estimates** will be higher than actual (conservative for SLA planning)
-- **Throughput estimates** will be lower than actual (you may achieve better performance)
+### Latent MoE
 
-**Future Enhancement:** For precise hybrid modeling, the framework could add an optional `num_attention_layers` field to `LLMArchitecture` to calculate exact KV cache requirements and attention FLOPs.
-
-**Note:** Despite the approximations, the estimates remain useful because:
-- 1D convolutions have O(hidden_dim × kernel_size × seq_len) complexity
-- FFN layers have O(hidden_dim × intermediate_dim × seq_len) complexity  
-- Both are linear in sequence length (unlike attention's O(seq_len²))
-- Conservative estimates are preferable for production capacity planning
+For `LATENT_MOE` sublayers (Nemotron-3-Super-120B), the calculator calls `LatentMoEConfig.get_prefill_flops()` / `get_decode_flops()` and `get_weight_params()` to compute exact FLOPs and memory traffic. See `LatentMoEConfig` in `LLM_STRUCTS.md` and the corresponding algorithm in `ALGORITHMS.md` for the full derivation.
 
 ### DSA (Dynamic Sparse Attention)
 For models with DSA (top-K KV selection), calculations reflect reduced KV cache access:

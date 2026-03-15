@@ -366,15 +366,24 @@ function displayModelArchitecture(arch) {
         html += '<div class="arch-section-title">Hybrid Architecture</div>';
         html += `
             <div class="architecture-item highlight">
-                <div class="arch-label">Attention Layers</div>
+                <div class="arch-label">Attention Sublayers</div>
                 <div class="arch-value">${arch.num_attention_layers}</div>
             </div>
             <div class="architecture-item highlight">
-                <div class="arch-label">Mamba Layers</div>
+                <div class="arch-label">Mamba Sublayers</div>
                 <div class="arch-value">${arch.num_mamba_layers}</div>
             </div>
         `;
-        
+
+        if (arch.num_latent_moe_layers != null && arch.num_latent_moe_layers > 0) {
+            html += `
+                <div class="architecture-item highlight">
+                    <div class="arch-label">LatentMoE Sublayers</div>
+                    <div class="arch-value">${arch.num_latent_moe_layers}</div>
+                </div>
+            `;
+        }
+
         if (arch.has_mamba_config) {
             html += `
                 <div class="architecture-item">
@@ -388,7 +397,30 @@ function displayModelArchitecture(arch) {
             `;
         }
     }
-    
+
+    // === Latent MoE ===
+    if (arch.has_latent_moe) {
+        html += '<div class="arch-section-title">Latent MoE</div>';
+        html += `
+            <div class="architecture-item highlight">
+                <div class="arch-label">Experts (total / active)</div>
+                <div class="arch-value">${arch.latent_moe_num_experts} / ${arch.latent_moe_num_active}</div>
+            </div>
+            <div class="architecture-item">
+                <div class="arch-label">Latent Size</div>
+                <div class="arch-value">${arch.latent_moe_latent_size}</div>
+            </div>
+            <div class="architecture-item">
+                <div class="arch-label">Expert Intermediate Size</div>
+                <div class="arch-value">${arch.latent_moe_expert_size}</div>
+            </div>
+            <div class="architecture-item">
+                <div class="arch-label">Shared Expert Size</div>
+                <div class="arch-value">${arch.latent_moe_shared_size} (×${arch.latent_moe_n_shared})</div>
+            </div>
+        `;
+    }
+
     // === Interleaved Dense/MoE FFN ===
     if (arch.has_ffn_layer_types) {
         html += '<div class="arch-section-title">Interleaved FFN</div>';

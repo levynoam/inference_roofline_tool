@@ -578,6 +578,78 @@ total_inference_state = (
 )
 ```
 
+### Latent MoE (Sublayer-style Hybrid)
+
+Used in **Nemotron-3-Super-120B**, a model where the 88 `hybrid_layer_types` entries are each a _single standalone sublayer_ — either a Mamba-only SSM (`MAMBA_ONLY`), a Latent MoE FFN (`LATENT_MOE`), or an attention-only layer (`ATTENTION_ONLY`). The pattern `MEMEMEM*E...` means 40 Mamba sublayers, 40 LatentMoE sublayers, and 8 pure-attention sublayers.
+
+**Latent MoE Architecture:**
+
+Rotuted experts operate in a _projected latent space_ of dimension `d_lat << H`. The single shared expert operates at full hidden dimension `H`.
+
+```
+token (H) → down-proj (H→d_lat) → router → top-k routed experts (d_lat→d_int→d_lat)
+                                          → up-proj (d_lat→H)
+                                 → shared expert (H→d_sh→H)
+→ element-wise sum
+```
+
+**Prefill FLOPs (per LATENT_MOE sublayer):**
+```python
+B, T, H = batch_size, seq_len, hidden_dim
+d_lat = latent_size            # e.g., 1024
+d_int = expert_intermediate_size   # e.g., 2688 (in latent space)
+d_sh  = shared_expert_intermediate_size  # e.g., 5376 (at full H)
+k = num_experts_per_token      # e.g., 22
+
+# Down-project to latent space
+flops_down = 2 * B * T * H * d_lat
+
+# Router over all experts
+flops_router = 2 * B * T * d_lat * num_experts
+
+# Top-k experts: up and down in latent space
+flops_experts = 2 * k * B * T * d_lat * d_int   # up projections
+              + 2 * k * B * T * d_int * d_lat   # down projections
+
+# Up-project back to full H
+flops_up = 2 * B * T * d_lat * H
+
+# Shared expert (at full hidden dim)
+flops_shared = 2 * B * T * H * d_sh + 2 * B * T * d_sh * H
+
+total_flops = flops_down + flops_router + flops_experts + flops_up + flops_shared
+```
+
+**Weight Parameters (per LATENT_MOE sublayer):**
+```python
+params_down = H * d_lat
+params_router = d_lat * num_experts
+params_experts = num_experts * (d_lat * d_int + d_int * d_lat)  # all experts stored
+params_up = d_lat * H
+params_shared = n_shared * (H * d_sh + d_sh * H)
+
+total_params = params_down + params_router + params_experts + params_up + params_shared
+```
+
+**Key Insight:** The latent projection significantly reduces the per-expert parameter count. Each routed expert only has `d_lat × d_int` (instead of `H × d_int`) parameters, allowing a much larger number of experts (e.g., 512) at manageable weight size.
+
+**Memory — no KV cache or SSM state for LATENT_MOE sublayers:**
+```python
+total_inference_state = (
+    kv_cache_for_ATTENTION_ONLY_sublayers +     # Only 8 sublayers in Nemotron-Super
+    mamba_state_for_MAMBA_ONLY_sublayers +      # Only 40 sublayers
+    # LATENT_MOE sublayers contribute nothing to stateful memory
+)
+```
+
+**Kernel Launches (per LATENT_MOE sublayer, ~6 kernels):**
+- Pre-FFN norm: 1
+- Down projection: 1
+- Router: 1
+- Expert computation (fused): 1
+- Up projection: 1
+- Shared expert: 1
+
 ### Linear Attention (Hybrid Linear/Full Attention)
 
 Models like Qwen3.5-397B interleave **linear attention** layers with standard **full attention** layers. Linear attention replaces the softmax-based attention with a kernel-based formulation that changes the compute complexity from O(L²) to O(L) and uses a fixed-size state instead of a growing KV cache.

@@ -40,6 +40,9 @@ class LLMArchitecture:
 - `dtype`: "float16" (default), "float32", "bfloat16", "int8", "int4"
 - `kernel_launch_latency`: Kernel launch overhead in seconds (default: 5e-6)
 - `tie_word_embeddings`: Share input/output embeddings (default: False)
+- `hybrid_layer_types`: List of `HybridLayerType` for Mamba/Attention hybrid or sublayer-style models
+- `mamba_config`: `Mamba2Config` — required when any layer is Mamba or MAMBA_ONLY
+- `latent_moe_config`: `LatentMoEConfig` — required when any layer is LATENT_MOE
 
 **Example:**
 ```python
@@ -208,6 +211,101 @@ moe_model = LLMArchitecture(
     is_moe=True
 )
 ```
+
+### `LatentMoEConfig`
+
+Configures Latent MoE, where routed experts operate in a **projected latent space** (smaller dimension) while the shared expert operates at full hidden dimension. Used in Nemotron-3-Super-120B.
+
+**Configuration:**
+```python
+@dataclass
+class LatentMoEConfig:
+    num_experts: int                            # Total routed experts (e.g., 512)
+    num_experts_per_token: int                  # Top-K experts activated (e.g., 22)
+    latent_size: int                            # Projected dimension for routed experts (e.g., 1024)
+    expert_intermediate_size: int               # Expert FFN size in latent space (e.g., 2688)
+    shared_expert_intermediate_size: int        # Shared expert FFN size at full H (e.g., 5376)
+    n_shared_experts: int = 1                   # Number of always-active shared experts
+    use_gating: bool = False                    # Gated activation for routed experts
+```
+
+**FLOPs per token (decode):**
+```
+  down-proj (H→latent) + router + top-k experts (up+down in latent space)
+  + up-proj (latent→H) + shared expert (H→shared_int→H)
+```
+
+**Example:**
+```python
+from llm_architecture import LatentMoEConfig
+
+latent_moe = LatentMoEConfig(
+    num_experts=512,
+    num_experts_per_token=22,
+    latent_size=1024,
+    expert_intermediate_size=2688,
+    shared_expert_intermediate_size=5376,
+    n_shared_experts=1,
+    use_gating=False,
+)
+
+# Weight parameter count
+params = latent_moe.get_weight_params(hidden_dim=4096)
+print(f"LatentMoE weight params: {params / 1e9:.2f}B")
+
+# FLOPs for a single decode step (batch=1)
+decode_flops = latent_moe.get_decode_flops(batch_size=1, hidden_dim=4096)
+```
+
+### `Mamba2Config`
+
+Configures the Mamba-2 selective state-space model (SSM) layer.
+
+**Configuration:**
+```python
+@dataclass
+class Mamba2Config:
+    num_heads: int                  # SSM heads (e.g., 128)
+    head_dim: int                   # Dimension per SSM head (e.g., 64)
+    state_size: int                 # State dimension per head (e.g., 128)
+    chunk_size: int = 64            # Chunk size for parallel scan
+    expand: int = 2                 # (unused directly; inner dim = num_heads * head_dim)
+```
+
+**Memory usage (Mamba state — does not grow with context):**
+```python
+mamba_state = batch_size * num_heads * head_dim * state_size * bytes_per_element
+# Constant size regardless of sequence length — contrast with KV cache
+```
+
+**Example:**
+```python
+from llm_architecture import Mamba2Config
+
+mamba = Mamba2Config(
+    num_heads=128,
+    head_dim=64,
+    state_size=128,
+    chunk_size=64,
+)
+# Prefill FLOPs (sequence of length L, hidden_dim H)
+flops = mamba.get_prefill_flops(seq_len=2048, hidden_dim=4096) * batch_size
+```
+
+### `HybridLayerType` (sublayer-style architectures)
+
+For models that mix different operation types, each layer (sublayer) is assigned a `HybridLayerType`:
+
+| Value | Description | Compute |
+|---|---|---|
+| `ATTENTION` | Full attention + FFN (traditional hybrid block) | Attention + FFN |
+| `MAMBA` | Mamba-2 SSM + FFN (traditional hybrid block) | Mamba + FFN |
+| `MLP` | FFN only | FFN |
+| `MAMBA_ONLY` | Mamba-2 SSM, no FFN (sublayer) | Mamba only |
+| `LATENT_MOE` | Latent MoE FFN, no attention/Mamba (sublayer) | LatentMoE FFN only |
+| `ATTENTION_ONLY` | Standard attention, no FFN (sublayer) | Attention only |
+
+In **Nemotron-3-Super-120B**, all 88 entries in `hybrid_layer_types` are one of `MAMBA_ONLY`, `LATENT_MOE`, or `ATTENTION_ONLY` — each character in the source pattern becomes its own standalone sublayer.
 
 ## Enumerations
 
@@ -526,6 +624,67 @@ LLMArchitecture(
     ),
     is_moe=True
 )
+```
+
+### Example 5: Sublayer-style Hybrid (Nemotron-Super style)
+
+In this architecture every entry in `hybrid_layer_types` is a single standalone operation — no combined blocks. The 88-sublayer Nemotron-3-Super-120B pattern encodes 40 Mamba-only sublayers (`M`), 40 LatentMoE sublayers (`E`), and 8 attention-only sublayers (`*`).
+
+```python
+from llm_architecture import (
+    LLMArchitecture, AttentionConfig, FFNConfig,
+    HybridLayerType, Mamba2Config, LatentMoEConfig,
+    ActivationType, AttentionType,
+)
+
+# Pre-built config available directly:
+from llm_configs import NEMOTRON_3_SUPER_120B
+
+# Or build your own sublayer-style hybrid:
+pattern = "MEMEMEM*E"  # 4 M, 4 E, 1 * = 9 sublayers
+mapping = {
+    'M': HybridLayerType.MAMBA_ONLY,
+    'E': HybridLayerType.LATENT_MOE,
+    '*': HybridLayerType.ATTENTION_ONLY,
+}
+sublayers = [mapping[c] for c in pattern]
+
+model = LLMArchitecture(
+    model_name="MySuper-10B",
+    model_family="Custom",
+    version="1.0",
+    num_layers=len(sublayers),     # 9
+    hidden_dim=4096,
+    vocab_size=131072,
+    max_sequence_length=131072,
+    attention_config=AttentionConfig(
+        num_attention_heads=32,
+        num_key_value_heads=2,
+        attention_type=AttentionType.GROUPED_QUERY,
+        head_dim=128,
+    ),
+    ffn_config=FFNConfig(intermediate_size=2688, activation=ActivationType.RELU2),
+    hybrid_layer_types=sublayers,
+    mamba_config=Mamba2Config(num_heads=128, head_dim=64, state_size=128),
+    latent_moe_config=LatentMoEConfig(
+        num_experts=512, num_experts_per_token=22,
+        latent_size=1024, expert_intermediate_size=2688,
+        shared_expert_intermediate_size=5376,
+    ),
+    total_parameters=10_000_000_000,
+    active_parameters=2_000_000_000,
+)
+
+# Count sublayer types
+print(f"Mamba sublayers:    {model.get_num_mamba_layers()}")       # 4
+print(f"LatentMoE sublayers:{model.get_num_latent_moe_layers()}")  # 4
+print(f"Attention sublayers:{model.get_num_attention_layers_hybrid()}")  # 1
+
+# KV cache only from attention sublayers
+kv = model.get_kv_cache_size(batch_size=1, sequence_length=1000, bytes_per_element=2)
+
+# Mamba state only from Mamba sublayers  
+state = model.get_mamba_state_size(batch_size=1, bytes_per_element=2)
 ```
 
 ## Integration with InferencePerformance

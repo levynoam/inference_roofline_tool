@@ -8,7 +8,7 @@ This system provides:
 - **Performance Calculation** - TTFT (Time-To-First-Token) and decode phase analysis
 - **Resource Modeling** - Compute, memory, bandwidth, network, and persistent storage requirements
 - **Bottleneck Analysis** - Identify limiting resources (compute, memory bandwidth, network, storage)
-- **Architecture Support** - Dense models, MoE (with storage offloading), MLA, DSA, and various attention mechanisms
+- **Architecture Support** - Dense models, MoE (with storage offloading), MLA, DSA, Mamba-2 hybrid, Latent MoE, sublayer-style hybrid architectures, and various attention mechanisms
 - **Interactive Web UI** - Batch analysis with 9 interactive charts
 - **Parallelism Strategies** - Single GPU, TP, PP, and hybrid configurations
 
@@ -97,25 +97,34 @@ print(f"Total Throughput: {decode.total_throughput:.2f} tokens/sec")
 - `AttentionConfig` - Attention mechanism (MHA, GQA, MQA, MLA, DSA)
 - `FFNConfig` - Feed-forward network configuration
 - `MoEConfig` - Mixture of Experts configuration
+- `LatentMoEConfig` - Latent-space MoE (Nemotron-Super style)
+- `Mamba2Config` - Mamba-2 SSM configuration
+- `HybridLayerType` - Sublayer types for hybrid architectures
 
 **Supported Features:**
 - ✅ Multiple attention types (Multi-Head, Grouped Query, Multi-Query)
 - ✅ MLA (Multi-head Latent Attention) for compressed KV cache
 - ✅ DSA (Dynamic Sparse Attention) for long context efficiency
 - ✅ MoE architectures with configurable experts
-- ✅ Various activations (GELU, SiLU, SwiGLU, GeGLU)
+- ✅ Latent MoE (experts operate in projected latent space)
+- ✅ Mamba-2 SSM layers and Mamba-2/Attention hybrid models
+- ✅ Sublayer-style hybrid architectures (e.g., Nemotron-3-Super)
+- ✅ Various activations (GELU, SiLU, SwiGLU, GeGLU, ReLU²)
 - ✅ Different normalizations (LayerNorm, RMSNorm)
 - ✅ Position encodings (RoPE, ALiBi, Absolute)
 
 ### 3. `llm_configs.py` - Pre-configured Models
 
 Ready-to-use configurations:
-- **Llama 2** (7B)
+- **Llama 4 Scout / Maverick**
 - **Llama 3** (8B, 70B)
-- **DeepSeek V3** (671B with MoE)
-- **Mistral** (7B)
-- **Mixtral** (8x7B MoE)
-- **GPT-3** (175B)
+- **DeepSeek V3 / 3.2** (671B MoE)
+- **Nemotron-3-30B** (hybrid Mamba-2/Attention MoE)
+- **Nemotron-3-Super-120B** (sublayer-style hybrid: Mamba-2 + Latent MoE + Attention)
+- **Qwen3** (480B MoE, Coder Next)
+- **Qwen3.5-397B** (interleaved linear/full attention)
+- **GLM-5**, **Hunyuan-A13B**, **GPT-OSS 20B / 120B**
+- **Kimi-K2.5**, **LFM2-3B**
 
 ### 4. `web_app.py` - Interactive Web Application
 
@@ -148,6 +157,9 @@ Flask-based web UI with:
 - **MLA (Multi-head Latent Attention)**: Compressed KV cache
 - **DSA (Dynamic Sparse Attention)**: Top-K KV selection for long context
 - **GQA/MQA**: Grouped and multi-query attention
+- **Mamba-2 Hybrid**: SSM layers interspersed with attention/FFN
+- **Latent MoE**: Experts that operate in a projected latent space (Nemotron-Super)
+- **Sublayer-style Hybrid**: Each sublayer is a single operation (Mamba-only, LatentMoE-only, Attention-only)
 
 ### Web Interface
 - **Batch Analysis**: Test multiple batch sizes at once
@@ -167,9 +179,9 @@ Flask-based web UI with:
 
 ## Testing
 
-Comprehensive test suite with 81 tests:
+Comprehensive test suite with 500+ tests across multiple files:
 ```bash
-pytest test_comprehensive.py -v
+pytest tests/ -v
 ```
 
 Test coverage includes:
@@ -181,6 +193,9 @@ Test coverage includes:
 - Parallelism strategies
 - MoE models
 - Bandwidth breakdowns
+- Mamba-2 hybrid architectures
+- Latent MoE (LatentMoEConfig FLOPs, weight params)
+- Sublayer-style hybrid (Nemotron-3-Super-120B pattern)
 
 ## Requirements
 
@@ -292,10 +307,10 @@ for step in result.step_details:
 ## Contributing
 
 When extending the system:
-1. Add tests for new features
+1. Add tests for new features in `tests/`
 2. Update relevant documentation guide
 3. Follow existing code patterns
-4. Verify all 81 tests still pass
+4. Verify all tests still pass (`pytest tests/ -q`)
 
 ## License
 

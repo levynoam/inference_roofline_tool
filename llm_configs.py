@@ -7,7 +7,8 @@ from llm_architecture import (
     LLMArchitecture, AttentionConfig, FFNConfig, MoEConfig,
     ArchitectureType, AttentionType, ActivationType, 
     NormalizationType, PositionEncodingType, LayerAttentionType,
-    HybridLayerType, Mamba2Config, FFNLayerType, LinearAttentionConfig
+    HybridLayerType, Mamba2Config, FFNLayerType, LinearAttentionConfig,
+    LatentMoEConfig
 )
 
 
@@ -977,6 +978,120 @@ QWEN3_5_397B = LLMArchitecture(
 )
 
 
+# Nemotron-3-Super-120B  (Nemotron-H hybrid Mamba/Attention/LatentMoE)
+# Config from: Nemotron-3-Super-120B.json
+#
+# Architecture overview:
+#   Each character in hybrid_override_pattern is a SUBLAYER (not a full transformer block):
+#   - M  → MAMBA_ONLY:      pure Mamba-2 SSM,  no attention, no FFN
+#   - E  → LATENT_MOE:      pure Latent MoE FFN, no attention, no Mamba
+#   - *  → ATTENTION_ONLY:  pure GQA attention,  no Mamba, no FFN
+#
+#   Logical compound blocks:
+#     "ME"  pairs (×32) = Mamba sublayer + LatentMoE sublayer  (≈ standard Mamba block)
+#     "M*E" triples (×8) = Mamba + Attention + LatentMoE       (full Mamba+Attn block)
+#
+# Pattern:
+#   "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+#   88 total sublayers: 40 M, 40 E, 8 *
+#
+# Latent MoE (E sublayers):
+#   Routed experts work in reduced latent space (1024) instead of full hidden (4096).
+#   512 routed experts, top-22 routing. 1 shared expert at full dimension.
+#
+# KV cache only on the 8 * (attention) sublayers.
+
+def _parse_nemotron_super_pattern(pattern: str) -> list:
+    """Parse Nemotron-Super hybrid_override_pattern into HybridLayerType list.
+
+    Each character is a separate sublayer:
+      M → MAMBA_ONLY      (Mamba SSM only, no FFN)
+      E → LATENT_MOE      (Latent MoE FFN only)
+      * → ATTENTION_ONLY  (GQA attention only, no FFN)
+    """
+    mapping = {
+        'M': HybridLayerType.MAMBA_ONLY,
+        'E': HybridLayerType.LATENT_MOE,
+        '*': HybridLayerType.ATTENTION_ONLY,
+    }
+    return [mapping[c] for c in pattern if c in mapping]
+
+
+_NEMOTRON_SUPER_PATTERN = (
+    "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*"
+    "EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+)
+_NEMOTRON_SUPER_HYBRID_LAYERS = _parse_nemotron_super_pattern(_NEMOTRON_SUPER_PATTERN)
+# Verify: should be 88 sublayers (40 M, 40 E, 8 *)
+assert len(_NEMOTRON_SUPER_HYBRID_LAYERS) == 88, f"Expected 88 sublayers, got {len(_NEMOTRON_SUPER_HYBRID_LAYERS)}"
+
+NEMOTRON_3_SUPER_120B = LLMArchitecture(
+    model_name="Nemotron-3-Super-120B",
+    model_family="Nemotron",
+    version="3.0-Super",
+    architecture_type=ArchitectureType.DECODER_ONLY,
+    num_layers=88,  # 88 sublayers total
+    hidden_dim=4096,
+    vocab_size=131072,
+    max_sequence_length=262144,  # 256K context (max_position_embeddings)
+    attention_config=AttentionConfig(
+        num_attention_heads=32,
+        num_key_value_heads=2,  # GQA 16:1 ratio
+        attention_type=AttentionType.GROUPED_QUERY,
+        head_dim=128,
+        attention_bias=False,
+    ),
+    ffn_config=FFNConfig(
+        # ffn_config is mostly unused here; Latent MoE uses latent_moe_config.
+        # We keep a placeholder intermediate size equal to moe_intermediate_size.
+        intermediate_size=2688,
+        activation=ActivationType.RELU2,
+        use_gating=False,
+    ),
+    # No standard MoE config – all expert FFN is handled via latent_moe_config
+    moe_config=None,
+    is_moe=False,
+    # Latent MoE configuration (used by LATENT_MOE sublayers)
+    latent_moe_config=LatentMoEConfig(
+        num_experts=512,              # n_routed_experts
+        num_experts_per_token=22,     # num_experts_per_tok
+        latent_size=1024,             # moe_latent_size
+        expert_intermediate_size=2688,  # moe_intermediate_size (in latent space)
+        shared_expert_intermediate_size=5376,  # moe_shared_expert_intermediate_size
+        n_shared_experts=1,
+        use_gating=False,             # mlp_hidden_act: relu2 (non-gated)
+    ),
+    # Sublayer pattern: 40 MAMBA_ONLY + 40 LATENT_MOE + 8 ATTENTION_ONLY = 88 sublayers
+    hybrid_layer_types=_NEMOTRON_SUPER_HYBRID_LAYERS,
+    mamba_config=Mamba2Config(
+        num_heads=128,    # mamba_num_heads
+        head_dim=64,      # mamba_head_dim  → d_inner = 128*64 = 8192
+        state_size=128,   # ssm_state_size
+        chunk_size=128,   # chunk_size
+        expand=2,         # expand
+        conv_kernel=4,    # conv_kernel
+    ),
+    normalization_type=NormalizationType.LAYER_NORM,  # layer_norm_epsilon specified
+    position_encoding=PositionEncodingType.ROTARY,
+    rope_theta=10000.0,
+    tie_word_embeddings=False,
+    dtype="bfloat16",
+    # Parameter estimate breakdown:
+    #   Embedding + LM head:  2 × 131072 × 4096              ≈  1.07B
+    #   40 M (MAMBA_ONLY):    40 × ~236M (in/out-proj+conv)  ≈  9.4B
+    #   40 E (LATENT_MOE):    40 × ~2.87B (all 512 experts)  ≈ 115B
+    #   8  * (ATTN_ONLY):      8 × ~35M  (Q/K/V/O)           ≈  0.3B
+    #   Total                                                 ≈ ~126B → ~120B (rounded)
+    total_parameters=120_000_000_000,  # ~120B total
+    # Active parameter estimate per token:
+    #   40 M layers fully active:       40 × ~236M            ≈  9.4B
+    #   40 E layers (22 experts + 1 shared):  40 × ~173M      ≈  6.9B
+    #   8 * layers fully active:         8 × ~35M             ≈  0.3B
+    #   Embedding + LM head:                                  ≈  1.1B
+    active_parameters=18_000_000_000,  # ~18B active per token
+)
+
+
 # Dictionary of all model configs
 ALL_MODELS = {
     "llama-4-scout": LLAMA_4_SCOUT,
@@ -994,6 +1109,7 @@ ALL_MODELS = {
     "gpt-oss-120b": GPT_OSS_120B,
     "gpt-oss-20b": GPT_OSS_20B,
     "nemotron-3-30b": NEMOTRON_3_30B,
+    "nemotron-3-super-120b": NEMOTRON_3_SUPER_120B,
     "qwen3.5-397b": QWEN3_5_397B,
 }
 

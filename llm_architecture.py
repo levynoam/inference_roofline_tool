@@ -293,6 +293,13 @@ class HybridLayerType(Enum):
     MAMBA = "mamba"  # Mamba-2 SSM layer (denoted as M in patterns)
     MLP = "mlp"  # Pure MLP/FFN layer (denoted as E in patterns)
 
+    # Sublayer types for architectures that decouple SSM, attention, and FFN into
+    # separate "sublayers" (e.g., Nemotron-3-Super-120B where each pattern character
+    # is an independent sublayer with no other component):
+    MAMBA_ONLY = "mamba_only"      # Mamba SSM with NO FFN (Nemotron-Super M sublayer)
+    LATENT_MOE = "latent_moe"      # Latent MoE FFN only, no attention/Mamba (Nemotron-Super E sublayer)
+    ATTENTION_ONLY = "attention_only"  # Attention only, no FFN (Nemotron-Super * sublayer)
+
 
 class FFNLayerType(Enum):
     """FFN layer types for dense/MoE interleaved architectures"""
@@ -387,6 +394,84 @@ class Mamba2Config:
 
 
 @dataclass
+class LatentMoEConfig:
+    """Configuration for Latent Mixture of Experts (Nemotron-3-Super style).
+
+    Unlike standard MoE where experts work at the full hidden dimension, in Latent MoE
+    the routed experts operate in a reduced latent space:
+      - Input is projected from hidden_dim (H) down to latent_size (L)
+      - Each routed expert computes: L → expert_intermediate → L
+      - Results are aggregated and projected back up from L to H
+
+    The shared expert(s) still work at the full hidden dimension H.
+
+    This design dramatically reduces the per-expert parameter count, enabling many more
+    experts (e.g., 512) while keeping memory bandwidth manageable.
+    """
+    num_experts: int                          # Total routed experts (e.g., 512)
+    num_experts_per_token: int                # Top-K routing (e.g., 22)
+    latent_size: int                          # Reduced input dim for routed experts (e.g., 1024)
+    expert_intermediate_size: int             # Per-expert FFN intermediate size in latent space (e.g., 2688)
+    shared_expert_intermediate_size: int      # Shared expert intermediate at full hidden dim (e.g., 5376)
+    n_shared_experts: int = 1                 # Number of shared experts
+    use_gating: bool = False                  # Gated activation (e.g., SwiGLU) in routed experts
+
+    def get_prefill_flops(self, batch_size: int, sequence_length: int, hidden_dim: int) -> int:
+        """
+        Calculate FLOPs for one Latent MoE layer during prefill.
+
+        Components:
+          1. Down-projection:  H → latent  (all tokens)
+          2. Router:           latent → E score per expert
+          3. Routed experts (top-k): latent → expert_intermediate → latent
+          4. Up-projection:    latent → H  (all tokens)
+          5. Shared expert(s): H → shared_intermediate → H  (always active)
+        """
+        B, T = batch_size, sequence_length
+        H, d_lat = hidden_dim, self.latent_size
+        d_int, d_sh = self.expert_intermediate_size, self.shared_expert_intermediate_size
+        k, E = self.num_experts_per_token, self.num_experts
+
+        flops = 0
+        # 1. Down projection
+        flops += 2 * B * T * H * d_lat
+        # 2. Router
+        flops += 2 * B * T * d_lat * E
+        # 3. Routed experts (up + down per active expert)
+        flops += 2 * k * B * T * d_lat * d_int  # up
+        flops += 2 * k * B * T * d_int * d_lat  # down
+        if self.use_gating:
+            flops += 2 * k * B * T * d_lat * d_int  # gate projection
+        # 4. Up projection
+        flops += 2 * B * T * d_lat * H
+        # 5. Shared expert(s): H → shared_intermediate → H (full dimension)
+        flops += self.n_shared_experts * 2 * B * T * H * d_sh  # up
+        flops += self.n_shared_experts * 2 * B * T * d_sh * H  # down
+        return flops
+
+    def get_decode_flops(self, batch_size: int, hidden_dim: int) -> int:
+        """FLOPs for one Latent MoE layer during decode (single new token)."""
+        return self.get_prefill_flops(batch_size, 1, hidden_dim)
+
+    def get_weight_params(self, hidden_dim: int) -> int:
+        """Total weight parameters in a Latent MoE layer (all experts, for memory capacity)."""
+        H, d_lat = hidden_dim, self.latent_size
+        d_int, d_sh = self.expert_intermediate_size, self.shared_expert_intermediate_size
+
+        per_expert = d_lat * d_int + d_int * d_lat
+        if self.use_gating:
+            per_expert += d_lat * d_int
+
+        return (
+            H * d_lat                                           # down proj
+            + d_lat * self.num_experts                          # router
+            + self.num_experts * per_expert                     # all routed experts
+            + d_lat * H                                         # up proj
+            + self.n_shared_experts * (H * d_sh + d_sh * H)   # shared expert(s)
+        )
+
+
+@dataclass
 class LLMArchitecture:
     """
     Complete specification of an LLM architecture
@@ -422,6 +507,11 @@ class LLMArchitecture:
     # Linear attention configuration (optional, for hybrid linear/full attention architectures)
     # Used when layer_types contains LINEAR_ATTENTION entries
     linear_attention_config: Optional[LinearAttentionConfig] = None
+
+    # Latent MoE configuration (optional, for architectures where routed experts operate
+    # in a reduced latent dimension — e.g., Nemotron-3-Super-120B)
+    # Used when hybrid_layer_types contains LATENT_MOE entries
+    latent_moe_config: Optional[LatentMoEConfig] = None
     
     # Hybrid layer pattern (for Mamba/Attention/MLP hybrid architectures like Nemotron-H)
     # Format: List of HybridLayerType specifying layer type for each layer
@@ -795,22 +885,37 @@ class LLMArchitecture:
         }
     
     def get_num_mamba_layers(self) -> int:
-        """Get the number of Mamba layers in hybrid architecture"""
+        """Get the number of Mamba layers in hybrid architecture.
+
+        Counts both MAMBA (Mamba+FFN) and MAMBA_ONLY (Mamba with no FFN) layer types.
+        """
         if not self.hybrid_layer_types:
             return 0
-        return sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.MAMBA)
+        return sum(1 for t in self.hybrid_layer_types
+                   if t in (HybridLayerType.MAMBA, HybridLayerType.MAMBA_ONLY))
     
     def get_num_attention_layers_hybrid(self) -> int:
-        """Get the number of attention layers in hybrid architecture"""
+        """Get the number of attention layers in hybrid architecture.
+
+        Counts both ATTENTION (Attention+FFN) and ATTENTION_ONLY (Attention with no FFN)
+        layer types, since both contribute to the KV cache.
+        """
         if not self.hybrid_layer_types:
             return self.num_layers
-        return sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.ATTENTION)
+        return sum(1 for t in self.hybrid_layer_types
+                   if t in (HybridLayerType.ATTENTION, HybridLayerType.ATTENTION_ONLY))
     
     def get_num_mlp_only_layers(self) -> int:
         """Get the number of MLP-only layers in hybrid architecture"""
         if not self.hybrid_layer_types:
             return 0
         return sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.MLP)
+
+    def get_num_latent_moe_layers(self) -> int:
+        """Get the number of Latent MoE sublayers (Nemotron-Super style E sublayers)."""
+        if not self.hybrid_layer_types:
+            return 0
+        return sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.LATENT_MOE)
     
     def get_num_dense_ffn_layers(self) -> int:
         """Get the number of dense FFN layers (non-MoE) in interleaved architectures"""
@@ -952,11 +1057,32 @@ class LLMArchitecture:
             num_attn = self.get_num_attention_layers_hybrid()
             num_mamba = self.get_num_mamba_layers()
             num_mlp = self.get_num_mlp_only_layers()
-            lines.append(f"Hybrid Architecture: {num_attn} Attention, {num_mamba} Mamba, {num_mlp} MLP layers")
+            num_latent_moe = self.get_num_latent_moe_layers()
+            # Count MAMBA_ONLY and ATTENTION_ONLY separately for clarity
+            num_mamba_only = sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.MAMBA_ONLY)
+            num_attn_only = sum(1 for t in self.hybrid_layer_types if t == HybridLayerType.ATTENTION_ONLY)
+            if num_latent_moe > 0 or num_mamba_only > 0 or num_attn_only > 0:
+                # Sublayer-style (e.g., Nemotron-Super)
+                lines.append(
+                    f"Hybrid Sublayer Architecture: {num_mamba_only} Mamba-only, "
+                    f"{num_attn_only} Attention-only, {num_latent_moe} LatentMoE sublayers"
+                )
+            else:
+                lines.append(f"Hybrid Architecture: {num_attn} Attention, {num_mamba} Mamba, {num_mlp} MLP layers")
         
         if self.mamba_config:
             lines.append(f"Mamba-2: heads={self.mamba_config.num_heads}, head_dim={self.mamba_config.head_dim}, "
                         f"state={self.mamba_config.state_size}, chunk={self.mamba_config.chunk_size}")
+        
+        if self.latent_moe_config:
+            lmoe = self.latent_moe_config
+            num_latent = self.get_num_latent_moe_layers()
+            lines.append(
+                f"Latent MoE: {num_latent} layers, experts={lmoe.num_experts}, "
+                f"top-k={lmoe.num_experts_per_token}, latent_size={lmoe.latent_size}, "
+                f"expert_intermediate={lmoe.expert_intermediate_size}, "
+                f"shared_intermediate={lmoe.shared_expert_intermediate_size}"
+            )
         
         if self.linear_attention_config:
             lac = self.linear_attention_config

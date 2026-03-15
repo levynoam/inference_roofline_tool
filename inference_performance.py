@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Dict, Tuple, List
 from enum import Enum
 from llm_architecture import (
-    LLMArchitecture, HybridLayerType, LayerAttentionType, FFNLayerType
+    LLMArchitecture, HybridLayerType, LayerAttentionType, FFNLayerType,
+    LatentMoEConfig
 )
 
 
@@ -467,8 +468,15 @@ class InferencePerformance:
         for layer_idx in range(model.num_layers):
             # ====== Determine layer types ======
             is_mamba_layer = False
+            is_mamba_no_ffn = False      # MAMBA_ONLY: Mamba SSM with no FFN
+            is_latent_moe_layer = False  # LATENT_MOE: Latent MoE FFN only
+            is_attention_only = False    # ATTENTION_ONLY: Attention with no FFN
             if model.hybrid_layer_types is not None:
-                is_mamba_layer = model.hybrid_layer_types[layer_idx] == HybridLayerType.MAMBA
+                _layer_hybrid_type = model.hybrid_layer_types[layer_idx]
+                is_mamba_layer = _layer_hybrid_type in (HybridLayerType.MAMBA, HybridLayerType.MAMBA_ONLY)
+                is_mamba_no_ffn = (_layer_hybrid_type == HybridLayerType.MAMBA_ONLY)
+                is_latent_moe_layer = (_layer_hybrid_type == HybridLayerType.LATENT_MOE)
+                is_attention_only = (_layer_hybrid_type == HybridLayerType.ATTENTION_ONLY)
             
             layer_attn_type = model.get_layer_attention_type(layer_idx)
             
@@ -479,15 +487,27 @@ class InferencePerformance:
                 is_moe_layer = True
             
             # Build layer label
-            if is_mamba_layer:
+            if is_mamba_no_ffn:
                 attn_label = "Mamba"
+                ffn_label = "None"
+            elif is_mamba_layer:
+                attn_label = "Mamba"
+                ffn_label = "MoE" if is_moe_layer else "Dense"
+            elif is_latent_moe_layer:
+                attn_label = "None"
+                ffn_label = "LatentMoE"
+            elif is_attention_only:
+                attn_label = "Full"
+                ffn_label = "None"
             elif layer_attn_type == LayerAttentionType.LINEAR_ATTENTION:
                 attn_label = "Linear"
+                ffn_label = "MoE" if is_moe_layer else "Dense"
             elif layer_attn_type == LayerAttentionType.SLIDING_ATTENTION:
                 attn_label = "Sliding"
+                ffn_label = "MoE" if is_moe_layer else "Dense"
             else:
                 attn_label = "Full"
-            ffn_label = "MoE" if is_moe_layer else "Dense"
+                ffn_label = "MoE" if is_moe_layer else "Dense"
             result.layer_types.append(f"{attn_label}/{ffn_label}")
             
             # ====== COMPUTE ======
@@ -495,7 +515,10 @@ class InferencePerformance:
             layer_ffn_flops = 0.0
             
             # --- Attention / sequence-mixing compute ---
-            if is_mamba_layer and model.mamba_config is not None:
+            if is_latent_moe_layer:
+                # LATENT_MOE sublayers have no sequence-mixing component
+                layer_attn_flops = 0.0
+            elif is_mamba_layer and model.mamba_config is not None:
                 if is_prefill:
                     layer_attn_flops = model.mamba_config.get_prefill_flops(L, H) * effective_batch
                 else:
@@ -568,7 +591,15 @@ class InferencePerformance:
                     layer_attn_flops = q_flops + k_flops + v_flops + attn_scores + attn_output + out_proj
             
             # --- FFN compute ---
-            if is_moe_layer and model.moe_config is not None:
+            if is_latent_moe_layer and model.latent_moe_config is not None:
+                # LATENT_MOE sublayer: entire compute is Latent MoE FFN, no standard attention/FFN
+                lmoe = model.latent_moe_config
+                layer_ffn_flops = lmoe.get_prefill_flops(effective_batch, seq_len_compute, H) if is_prefill \
+                    else lmoe.get_decode_flops(effective_batch, H)
+            elif is_mamba_no_ffn or is_attention_only:
+                # MAMBA_ONLY and ATTENTION_ONLY sublayers have no FFN component
+                layer_ffn_flops = 0.0
+            elif is_moe_layer and model.moe_config is not None:
                 num_active = model.moe_config.num_experts_per_token
                 intermediate = model.ffn_config.intermediate_size
                 router = 2 * effective_batch * seq_len_compute * H * model.moe_config.num_experts
@@ -596,7 +627,10 @@ class InferencePerformance:
             layer_ffn_traffic = 0.0
             
             # --- Attention weight parameters ---
-            if is_mamba_layer and model.mamba_config is not None:
+            if is_latent_moe_layer:
+                # LATENT_MOE sublayers have no attention/SSM weights
+                attn_weight_params = 0
+            elif is_mamba_layer and model.mamba_config is not None:
                 mc = model.mamba_config
                 d_inner = mc.d_inner
                 d_proj = 2 * d_inner + 2 * mc.num_heads * mc.state_size + mc.num_heads
@@ -643,7 +677,10 @@ class InferencePerformance:
             layer_attn_traffic += attn_weight_params * bytes_per_param / tp
             
             # --- KV cache / state traffic ---
-            if is_mamba_layer and model.mamba_config is not None:
+            if is_latent_moe_layer:
+                # LATENT_MOE sublayers have no KV cache or SSM state
+                pass
+            elif is_mamba_layer and model.mamba_config is not None:
                 # Mamba state: read + write
                 mamba_state = model.mamba_config.get_state_size_bytes(effective_batch, int(bytes_per_param))
                 layer_attn_traffic += 2 * mamba_state / tp
@@ -680,7 +717,13 @@ class InferencePerformance:
                 layer_attn_traffic += kv_traffic / tp
             
             # --- FFN weight parameters ---
-            if is_moe_layer and model.moe_config is not None:
+            if is_latent_moe_layer and model.latent_moe_config is not None:
+                # Full weight params for all experts (storage/bandwidth for all expert weights)
+                ffn_weight_params = model.latent_moe_config.get_weight_params(H)
+            elif is_mamba_no_ffn or is_attention_only:
+                # These sublayers have no FFN weights
+                ffn_weight_params = 0
+            elif is_moe_layer and model.moe_config is not None:
                 intermediate = model.ffn_config.intermediate_size
                 E = model.moe_config.num_experts
                 router_params = H * E
@@ -706,7 +749,22 @@ class InferencePerformance:
             layer_attn_kernels = 0
             layer_ffn_kernels = 0
             
-            if is_mamba_layer and model.mamba_config is not None:
+            if is_latent_moe_layer:
+                # LATENT_MOE: down_proj + router + experts + up_proj + shared = ~5 kernels
+                layer_attn_kernels = 0
+                layer_ffn_kernels = 5 + 3  # 5 base + 3 MoE overhead (router, dispatch, combine)
+            elif is_mamba_no_ffn:
+                # MAMBA_ONLY: just Mamba SSM, no FFN
+                if is_prefill:
+                    layer_attn_kernels = model.mamba_config.get_prefill_kernel_launches(L) if model.mamba_config else 5
+                else:
+                    layer_attn_kernels = model.mamba_config.get_decode_kernel_launches() if model.mamba_config else 4
+                layer_ffn_kernels = 0
+            elif is_attention_only:
+                # ATTENTION_ONLY: just attention, no FFN
+                layer_attn_kernels = 6
+                layer_ffn_kernels = 0
+            elif is_mamba_layer and model.mamba_config is not None:
                 if is_prefill:
                     layer_attn_kernels = model.mamba_config.get_prefill_kernel_launches(L)
                 else:
@@ -1858,10 +1916,23 @@ class InferencePerformance:
         for layer_idx in range(N):
             # Check if this is a Mamba layer in hybrid architecture
             is_mamba_layer = False
+            is_mamba_no_ffn = False
+            is_latent_moe_layer = False
+            is_attention_only = False
             if self.model.hybrid_layer_types is not None:
-                is_mamba_layer = self.model.hybrid_layer_types[layer_idx] == HybridLayerType.MAMBA
+                _ltype = self.model.hybrid_layer_types[layer_idx]
+                is_mamba_layer = _ltype in (HybridLayerType.MAMBA, HybridLayerType.MAMBA_ONLY)
+                is_mamba_no_ffn = (_ltype == HybridLayerType.MAMBA_ONLY)
+                is_latent_moe_layer = (_ltype == HybridLayerType.LATENT_MOE)
+                is_attention_only = (_ltype == HybridLayerType.ATTENTION_ONLY)
             
-            if is_mamba_layer and self.model.mamba_config is not None:
+            if is_latent_moe_layer:
+                # LATENT_MOE sublayer: no sequence mixing, all compute is Latent MoE FFN
+                if self.model.latent_moe_config is not None:
+                    lmoe = self.model.latent_moe_config
+                    ffn_flops += lmoe.get_prefill_flops(effective_batch, L, H)
+                # no contribution to attention_flops or mamba_flops
+            elif is_mamba_layer and self.model.mamba_config is not None:
                 # Mamba-2 layer: use Mamba-specific FLOPs calculation
                 layer_mamba_flops = self.model.mamba_config.get_prefill_flops(L, H)
                 mamba_flops += layer_mamba_flops * effective_batch
@@ -1917,37 +1988,40 @@ class InferencePerformance:
                     attention_flops += layer_attn_flops
             
             # 2. FFN compute - check if this layer is Dense or MoE
-            # Note: In hybrid Mamba/Attention architectures, MLP layers might be separate
-            # For now, all non-Mamba layers have FFN (standard transformer behavior)
-            # Mamba layers may also have FFN depending on architecture
+            # LATENT_MOE layers are handled above (they contribute to ffn_flops via LatentMoEConfig).
+            # MAMBA_ONLY and ATTENTION_ONLY sublayers have no FFN.
             layer_ffn_flops = 0.0
             
-            # Determine if this specific layer is MoE or Dense
-            is_moe_layer = False
-            if self.model.ffn_layer_types is not None:
-                # Use per-layer FFN type specification
-                from llm_architecture import FFNLayerType
-                is_moe_layer = self.model.ffn_layer_types[layer_idx] == FFNLayerType.MOE
-            elif self.model.is_moe:
-                # All layers are MoE if no per-layer specification
-                is_moe_layer = True
-            
-            if is_moe_layer and self.model.moe_config:
-                # MoE layer: router + active experts
-                layer_ffn_flops += 2 * effective_batch * L * H * self.model.moe_config.num_experts  # Router
-                num_active_experts = self.model.moe_config.num_experts_per_token
-                intermediate = self.model.ffn_config.intermediate_size  # Per-expert size
-                layer_ffn_flops += 2 * effective_batch * L * H * intermediate * num_active_experts
-                if self.model.ffn_config.use_gating:
-                    layer_ffn_flops += 2 * effective_batch * L * H * intermediate * num_active_experts
-                layer_ffn_flops += 2 * effective_batch * L * intermediate * H * num_active_experts
+            if is_latent_moe_layer:
+                # Already accounted for above in the latent_moe block
+                pass
+            elif is_mamba_no_ffn or is_attention_only:
+                # No FFN for pure SSM or pure attention sublayers
+                layer_ffn_flops = 0.0
             else:
-                # Dense layer: use dense_intermediate_size
-                intermediate = self.model.get_dense_intermediate_size()
-                layer_ffn_flops += 2 * effective_batch * L * H * intermediate
-                if self.model.ffn_config.use_gating:
+                # Determine if this specific layer is MoE or Dense
+                is_moe_layer = False
+                if self.model.ffn_layer_types is not None:
+                    is_moe_layer = self.model.ffn_layer_types[layer_idx] == FFNLayerType.MOE
+                elif self.model.is_moe:
+                    is_moe_layer = True
+                
+                if is_moe_layer and self.model.moe_config:
+                    # MoE layer: router + active experts
+                    layer_ffn_flops += 2 * effective_batch * L * H * self.model.moe_config.num_experts  # Router
+                    num_active_experts = self.model.moe_config.num_experts_per_token
+                    intermediate = self.model.ffn_config.intermediate_size  # Per-expert size
+                    layer_ffn_flops += 2 * effective_batch * L * H * intermediate * num_active_experts
+                    if self.model.ffn_config.use_gating:
+                        layer_ffn_flops += 2 * effective_batch * L * H * intermediate * num_active_experts
+                    layer_ffn_flops += 2 * effective_batch * L * intermediate * H * num_active_experts
+                else:
+                    # Dense layer: use dense_intermediate_size
+                    intermediate = self.model.get_dense_intermediate_size()
                     layer_ffn_flops += 2 * effective_batch * L * H * intermediate
-                layer_ffn_flops += 2 * effective_batch * L * intermediate * H
+                    if self.model.ffn_config.use_gating:
+                        layer_ffn_flops += 2 * effective_batch * L * H * intermediate
+                    layer_ffn_flops += 2 * effective_batch * L * intermediate * H
             
             ffn_flops += layer_ffn_flops
             

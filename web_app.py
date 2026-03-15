@@ -156,6 +156,15 @@ def calculate():
                     'mamba_state_size': model.mamba_config.state_size if model.mamba_config else None,
                     'mamba_num_heads': model.mamba_config.num_heads if model.mamba_config else None,
                     'mamba_head_dim': model.mamba_config.head_dim if model.mamba_config else None,
+                    'num_latent_moe_layers': model.get_num_latent_moe_layers() if model.hybrid_layer_types else None,
+                    # Latent MoE
+                    'has_latent_moe': model.latent_moe_config is not None,
+                    'latent_moe_num_experts': model.latent_moe_config.num_experts if model.latent_moe_config else None,
+                    'latent_moe_num_active': model.latent_moe_config.num_experts_per_token if model.latent_moe_config else None,
+                    'latent_moe_latent_size': model.latent_moe_config.latent_size if model.latent_moe_config else None,
+                    'latent_moe_expert_size': model.latent_moe_config.expert_intermediate_size if model.latent_moe_config else None,
+                    'latent_moe_shared_size': model.latent_moe_config.shared_expert_intermediate_size if model.latent_moe_config else None,
+                    'latent_moe_n_shared': model.latent_moe_config.n_shared_experts if model.latent_moe_config else None,
                     # Interleaved Dense/MoE FFN
                     'has_ffn_layer_types': model.ffn_layer_types is not None,
                     'num_dense_ffn_layers': model.get_num_dense_ffn_layers() if model.ffn_layer_types else None,
@@ -303,6 +312,15 @@ def calculate():
                     'mamba_state_size': model.mamba_config.state_size if model.mamba_config else None,
                     'mamba_num_heads': model.mamba_config.num_heads if model.mamba_config else None,
                     'mamba_head_dim': model.mamba_config.head_dim if model.mamba_config else None,
+                    'num_latent_moe_layers': model.get_num_latent_moe_layers() if model.hybrid_layer_types else None,
+                    # Latent MoE
+                    'has_latent_moe': model.latent_moe_config is not None,
+                    'latent_moe_num_experts': model.latent_moe_config.num_experts if model.latent_moe_config else None,
+                    'latent_moe_num_active': model.latent_moe_config.num_experts_per_token if model.latent_moe_config else None,
+                    'latent_moe_latent_size': model.latent_moe_config.latent_size if model.latent_moe_config else None,
+                    'latent_moe_expert_size': model.latent_moe_config.expert_intermediate_size if model.latent_moe_config else None,
+                    'latent_moe_shared_size': model.latent_moe_config.shared_expert_intermediate_size if model.latent_moe_config else None,
+                    'latent_moe_n_shared': model.latent_moe_config.n_shared_experts if model.latent_moe_config else None,
                     # Interleaved Dense/MoE FFN
                     'has_ffn_layer_types': model.ffn_layer_types is not None,
                     'num_dense_ffn_layers': model.get_num_dense_ffn_layers() if model.ffn_layer_types else None,
